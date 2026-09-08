@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
     AttentionMetadata,
+    CommonAttentionMetadata,
     MLAAttentionImpl,
     MultipleOf,
 )
@@ -132,7 +133,8 @@ class FlashAttnMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashAttnMLASparseMetadata]
 ):
     metadata_cls = FlashAttnMLASparseMetadata
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Each query is a single-token FA3 row with its own sparse index list.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(
         self,
@@ -148,6 +150,13 @@ class FlashAttnMLASparseMetadataBuilder(
         )
         threshold = {16: 128, 32: 128, 64: 256, 128: 256}.get(num_q_heads, 256)
         self._init_reorder_batch_threshold(threshold, supports_spec_as_decode=True)
+
+    def _build_req_id_per_token(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor:
+        # Adaptive verification redistributes the draft budget only on device.
+        return common_attn_metadata.token_to_req_indices(self.req_id_per_token_buffer)
 
 
 class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):

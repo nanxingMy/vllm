@@ -26,6 +26,7 @@ the index construction differs.
 """
 
 import math
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -56,6 +57,9 @@ if not current_platform.is_cuda():
 
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+    FlashAttnMLASparseBackend,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
 )
@@ -122,6 +126,7 @@ def _run_sparse_backend_vs_sdpa(
     qk_nope_head_dim: int = 128,
     v_head_dim: int = 128,
     stale_cpu_query_lens: list[int] | None = None,
+    replay_cuda_graph: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run a sparse-MLA backend with the given per-token indices and compute a
     dense per-token SDPA reference over the SAME indices.
@@ -207,7 +212,7 @@ def _run_sparse_backend_vs_sdpa(
     kv_cache_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     global_token_idx = 0
 
-    for s_len, q_len in zip(seq_lens, query_lens):
+    for req_idx, (s_len, q_len) in enumerate(zip(seq_lens, query_lens)):
         ctx_len = s_len - q_len
 
         q_c = torch.rand(
@@ -219,6 +224,11 @@ def _run_sparse_backend_vs_sdpa(
         )
         kv_c_full = torch.rand(s_len, kv_lora_rank, dtype=dtype, device=device)
         k_pe_full = torch.rand(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+
+        if stale_cpu_query_lens is not None:
+            # Distinct request values make a wrong KV request unmistakable even
+            # with the tolerance needed for the FP8 backend.
+            kv_c_full *= req_idx + 1
 
         if force_future_dominance:
             # Scale the last block token's latent KV so its key/value dominate the
@@ -392,9 +402,45 @@ def _run_sparse_backend_vs_sdpa(
         metadata.num_actual_tokens, num_heads * v_head_dim, dtype=dtype, device=device
     )
     with torch.inference_mode():
-        backend_output = mock_layer.forward_impl(
-            query_vllm, kv_c_vllm, k_pe_vllm, kv_cache, metadata, out_buffer
-        )
+        if replay_cuda_graph:
+            assert stale_cpu_query_lens is not None
+            # Capture with uniform request boundaries, then rebuild metadata
+            # with adaptive device boundaries before replaying the SAME graph.
+            device_starts = common_attn_metadata.query_start_loc.clone()
+            common_attn_metadata.query_start_loc.copy_(
+                common_attn_metadata.query_start_loc_cpu
+            )
+            capture_common = replace(
+                common_attn_metadata, _token_to_req_indices_cache=None
+            )
+            metadata = builder.build(0, capture_common)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    mock_layer.forward_impl(
+                        query_vllm, kv_c_vllm, k_pe_vllm, kv_cache, metadata, out_buffer
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                backend_output = mock_layer.forward_impl(
+                    query_vllm, kv_c_vllm, k_pe_vllm, kv_cache, metadata, out_buffer
+                )
+            common_attn_metadata.query_start_loc.copy_(device_starts)
+            replay_common = replace(
+                common_attn_metadata, _token_to_req_indices_cache=None
+            )
+            replay_metadata = builder.build(0, replay_common)
+            assert (
+                replay_metadata.req_id_per_token.data_ptr()
+                == metadata.req_id_per_token.data_ptr()
+            )
+            graph.replay()
+        else:
+            backend_output = mock_layer.forward_impl(
+                query_vllm, kv_c_vllm, k_pe_vllm, kv_cache, metadata, out_buffer
+            )
     return backend_output, sdpa_reference, causal_reference
 
 
@@ -419,16 +465,32 @@ def _skip_if_backend_unavailable(backend_cls, kv_cache_dtype: str, block_size: i
         cap = current_platform.get_device_capability()
         if cap is None or not backend_cls.supports_compute_capability(cap):
             pytest.skip("FlashInferMLASparseTRTLLMBackend requires SM 10.x capability")
+    elif backend_cls is FlashAttnMLASparseBackend:
+        from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
+
+        cap = current_platform.get_device_capability()
+        if cap is None or not backend_cls.supports_compute_capability(cap):
+            pytest.skip("FlashAttnMLASparseBackend requires SM 9.x capability")
+        if not flash_attn_supports_mla():
+            pytest.skip("FlashAttention MLA is not available")
 
 
-def test_flashinfer_sparse_mla_adaptive_varlen_matches_sdpa(
+@pytest.mark.parametrize(
+    "backend_cls,kv_cache_dtype",
+    [(FlashInferMLASparseTRTLLMBackend, "fp8"), (FlashAttnMLASparseBackend, "auto")],
+    ids=["SM100-FlashInfer", "SM90-FlashAttention"],
+)
+@pytest.mark.parametrize("replay_cuda_graph", [False, True], ids=["eager", "graph"])
+def test_sparse_mla_adaptive_varlen_matches_sdpa(
     default_vllm_config,
     dist_init,
     workspace_init,
+    backend_cls,
+    kv_cache_dtype,
+    replay_cuda_graph,
 ):
-    """Adaptive request boundaries must drive SM100 sparse index conversion."""
-    backend_cls = FlashInferMLASparseTRTLLMBackend
-    _skip_if_backend_unavailable(backend_cls, "fp8", 64)
+    """Adaptive request boundaries must drive sparse index conversion."""
+    _skip_if_backend_unavailable(backend_cls, kv_cache_dtype, 64)
     assert (
         backend_cls.get_builder_cls().get_cudagraph_support(None, None)
         == AttentionCGSupport.ALWAYS
@@ -450,13 +512,14 @@ def test_flashinfer_sparse_mla_adaptive_varlen_matches_sdpa(
         seq_lens,
         query_lens,
         sparse_indices,
-        "fp8",
+        kv_cache_dtype,
         64,
         16,
         device,
         qk_nope_head_dim=192,
         v_head_dim=256,
         stale_cpu_query_lens=[4, 4, 4, 4],
+        replay_cuda_graph=replay_cuda_graph,
     )
 
     torch.testing.assert_close(
