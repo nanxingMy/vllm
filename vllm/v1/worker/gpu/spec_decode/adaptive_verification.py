@@ -329,15 +329,6 @@ class AdaptiveVerificationManager:
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
-        if get_tp_group().rank_in_group == 0:
-            logger.info(
-                "Adaptive verification draft tokens: requests=%d, "
-                "scheduled_per_request=%s, selected_total=%d, max_total=%d",
-                num_reqs,
-                scheduled_drafts.tolist(),
-                draft_budget,
-                max_draft_budget,
-            )
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -420,6 +411,19 @@ class AdaptiveVerificationManager:
                     draft_budget,
                     self.num_speculative_steps,
                 )
+
+        if get_tp_group().rank_in_group == 0:
+            selected_drafts = capacities.tolist()
+            logger.info(
+                "Adaptive verification draft tokens: request_ids=%s, "
+                "scheduled_per_request=%s, selected_per_request=%s, "
+                "selected_total=%d, max_total=%d",
+                req_ids,
+                scheduled_drafts.tolist(),
+                selected_drafts,
+                draft_budget,
+                int(scheduled_drafts.sum()),
+            )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_copy_to_gpu(
