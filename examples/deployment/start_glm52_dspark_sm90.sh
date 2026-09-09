@@ -14,6 +14,8 @@ if [[ ! -x "$venv_dir/bin/python" ]]; then
     echo "Missing environment: $venv_dir; run tools/install_glm52_dspark_sm90.sh" >&2
     exit 1
 fi
+export PATH="$venv_dir/bin:$PATH"
+unset VLLM_VENV
 
 export VLLM_USE_V2_MODEL_RUNNER=1
 adaptive=${ADAPTIVE_VERIFICATION:-true}
