@@ -329,6 +329,15 @@ class AdaptiveVerificationManager:
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        if get_tp_group().rank_in_group == 0:
+            logger.info(
+                "Adaptive verification draft tokens: requests=%d, "
+                "scheduled_per_request=%s, selected_total=%d, max_total=%d",
+                num_reqs,
+                scheduled_drafts.tolist(),
+                draft_budget,
+                max_draft_budget,
+            )
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
