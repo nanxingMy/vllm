@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+import logging
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -412,9 +413,9 @@ class AdaptiveVerificationManager:
                     self.num_speculative_steps,
                 )
 
-        if get_tp_group().rank_in_group == 0:
+        if logger.isEnabledFor(logging.DEBUG) and get_tp_group().rank_in_group == 0:
             selected_drafts = capacities.tolist()
-            logger.info(
+            logger.debug(
                 "Adaptive verification draft tokens: request_ids=%s, "
                 "scheduled_per_request=%s, selected_per_request=%s, "
                 "selected_total=%d, max_total=%d",
